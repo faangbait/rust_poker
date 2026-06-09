@@ -1,5 +1,3 @@
-#![feature(test)]
-
 /// # Rust Poker
 /// A texas holdem poker library
 ///
@@ -35,7 +33,6 @@ extern crate crossbeam;
 extern crate rand;
 extern crate serde;
 extern crate serde_json;
-extern crate test;
 // extern crate rust_embed;
 
 #[cfg(all(feature = "indexer"))]

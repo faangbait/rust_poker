@@ -95,13 +95,6 @@ impl Evaluator {
 mod tests {
     use super::*;
     use crate::constants::HAND_CATEGORY_SHIFT;
-    use test::Bencher;
-
-    #[bench]
-    fn bench_lookup(b: &mut Bencher) {
-        let hand = hand::Hand::default() + hand::CARDS[0] + hand::CARDS[1];
-        b.iter(|| evaluate(&hand));
-    }
 
     #[test]
     fn test_four_of_a_kind() {

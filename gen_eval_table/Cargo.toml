@@ -1,10 +1,10 @@
 [package]
 name = "gen_eval_table"
-version = "0.1.2"
+version = "0.2.0"
 authors = ["ruffers9 <kwmurph2@asu.edu>"]
-edition = "2018"
+edition = "2024"
 description = "Generates eval table in build script used by rust_poker"
 license = "MIT"
 
 [dependencies]
-read_write = { path = "../read_write", version = "0.1.1" }
+read_write = { path = "../read_write", version = "0.2.0" }

@@ -4,3 +4,7 @@
 
 # dont close data files
 *.dat
+
+.devcontainer
+debug
+target

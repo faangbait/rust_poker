@@ -377,7 +377,7 @@ impl Simulator {
                 used_cards_mask |= combo.mask;
                 for j in 0..self.combined_ranges[i].player_count() {
                     let player_idx = self.combined_ranges[i].players()[j];
-                    player_hands[player_idx].cards = combo.hole_cards[player_idx];
+                    player_hands[player_idx].cards = combo.hole_cards[j];
                     player_hands[player_idx].player_idx = player_idx;
                 }
             }
@@ -944,7 +944,6 @@ fn randomize_board<R: Rng>(
 mod tests {
     use super::*;
     use crate::hand_range::{get_card_mask, HandRange};
-    use test::Bencher;
 
     #[test]
     fn test_approx_weighted() {
@@ -977,42 +976,21 @@ mod tests {
         assert_eq!(equity[0], 0.8520371330210104);
     }
 
-    #[bench]
-    fn bench_random_random(b: &mut Bencher) {
-        // best score with these params
-        // 1,892,190 ns/iter (+/- 176,130)
-        const ERROR: f64 = 0.05;
+    #[test]
+    fn test_exact_multi_combined_range() {
+        // regression: 4 non-conflicting ranges fully join past MAX_SIZE, so they
+        // split into 2 combined ranges (players [0,1] and [2,3]). The exact path
+        // must index combo.hole_cards by local position, not global player_idx,
+        // or players 2/3 read the (52,52,0) default and panic in from_hole_cards.
         const THREADS: u8 = 4;
-        let ranges = HandRange::from_strings(["random".to_string(), "random".to_string()].to_vec());
-        let board_mask = get_card_mask("");
-        b.iter(|| {
-            let equity = approx_equity(&ranges, board_mask, THREADS, 0.001).unwrap();
-            assert!(equity[0] > 0.5 - ERROR);
-            assert!(equity[0] < 0.5 + ERROR);
-        });
-    }
-
-    #[bench]
-    fn bench_approx_river(b: &mut Bencher) {
-        // best score with these params
-        // 409,370 ns/iter (+/- 335,357)
-        const THREADS: u8 = 4;
-        let ranges = HandRange::from_strings(["ah2c".to_string(), "88+".to_string()].to_vec());
-        let board_mask = get_card_mask("");
-        b.iter(|| {
-            approx_equity(&ranges, board_mask, THREADS, 0.001).unwrap();
-        });
-    }
-
-    #[bench]
-    fn bench_exact_river(b: &mut Bencher) {
-        // best score with these params
-        // 107,971 ns/iter (+/- 7,578)
-        const THREADS: u8 = 4;
-        let ranges = HandRange::from_strings(["ah2c".to_string(), "88+".to_string()].to_vec());
-        let board_mask = get_card_mask("5hJsTc9d4s");
-        b.iter(|| {
-            exact_equity(&ranges, board_mask, THREADS).unwrap();
-        });
+        let ranges = HandRange::from_strings(
+            ["AKo".to_string(), "QJo".to_string(), "T9o".to_string(), "87o".to_string()].to_vec(),
+        );
+        let equity = exact_equity(&ranges, get_card_mask(""), THREADS).unwrap();
+        assert!((equity.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+        // AKo dominates the other three offsuit holdings
+        assert!(equity[0] > equity[1]);
+        assert!(equity[0] > equity[2]);
+        assert!(equity[0] > equity[3]);
     }
 }
