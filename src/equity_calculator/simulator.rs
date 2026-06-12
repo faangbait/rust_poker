@@ -1301,10 +1301,15 @@ impl Simulator {
                             batch_equity += batch.wins_by_mask[i] as f64;
                         }
                     } else {
+                        // Split pots must use fractional division: casting after an
+                        // integer divide (`(u64 / u64) as f64`) silently drops the
+                        // remainder whenever the weighted count isn't divisible by the
+                        // number of winners (e.g. any 3-way tie), losing equity. This
+                        // mirrors OMPEval's `winsByPlayerMask[i] / (double)winnerCount`.
                         results.ties[batch.player_ids[j]] +=
-                            (batch.wins_by_mask[i] / winner_count) as f64;
+                            batch.wins_by_mask[i] as f64 / winner_count as f64;
                         if batch.player_ids[j] == 0 {
-                            batch_equity += (batch.wins_by_mask[i] / winner_count) as f64;
+                            batch_equity += batch.wins_by_mask[i] as f64 / winner_count as f64;
                         }
                     }
                     actual_player_mask |= 1 << batch.player_ids[j];
@@ -1425,6 +1430,26 @@ mod tests {
         let equity = exact_equity(&ranges, board_mask, THREADS).unwrap();
         println!("{:?}", equity);
         assert_eq!(equity[0], 0.8520371330210104);
+    }
+
+    #[test]
+    fn test_three_way_tie_split() {
+        // Regression: split pots must divide as floats, not truncating u64 integer
+        // division. A royal flush on the board forces all players to play the board,
+        // so every showdown is an n-way tie. With @1 weights each showdown has weight
+        // 1, so a 3-way split is 1/3 per player. The old `(wins / 3) as f64` truncated
+        // to 0 -> zero equity sum -> NaN; correct fractional split gives 1/3 each.
+        const THREADS: u8 = 1;
+        let board_mask = get_card_mask("AhKhQhJhTh");
+        let ranges = HandRange::from_strings(
+            ["2s3s@1".to_string(), "4d5d@1".to_string(), "6c7c@1".to_string()].to_vec(),
+        );
+        let equity = exact_equity(&ranges, board_mask, THREADS).unwrap();
+        for e in &equity {
+            assert!(e.is_finite(), "equity must be finite, got {:?}", equity);
+            assert!((e - 1.0 / 3.0).abs() < 1e-9, "expected 1/3 split, got {:?}", equity);
+        }
+        assert!((equity.iter().sum::<f64>() - 1.0).abs() < 1e-9);
     }
 
     #[test]
