@@ -171,6 +171,457 @@ pub fn approx_equity(
     Ok(results.get_equity())
 }
 
+/// Sequential exact equity — no Arc, no Mutex, no OS thread spawn.
+///
+/// Produces bit-for-bit identical results to `exact_equity` with n_threads = 1.
+/// Intended to be called from inside a Rayon worker (e.g. compute_4way_equities)
+/// where spinning up a second OS thread wastes a scheduler round-trip and the
+/// synchronisation primitives in the multi-threaded path are pure overhead.
+pub fn exact_equity_seq(
+    hand_ranges: &[HandRange],
+    board_mask: u64,
+) -> Result<Vec<f64>, SimulatorError> {
+    if hand_ranges.len() < MIN_PLAYERS {
+        return Err(SimulatorError::TooFewPlayers);
+    }
+    if hand_ranges.len() > MAX_PLAYERS {
+        return Err(SimulatorError::TooManyPlayers);
+    }
+    if board_mask.count_ones() > BOARD_CARDS {
+        return Err(SimulatorError::TooManyBoardCards);
+    }
+
+    let mut hand_ranges = hand_ranges.to_owned();
+    hand_ranges
+        .iter_mut()
+        .for_each(|h| h.remove_conflicting_combos(board_mask));
+    let combined_ranges = CombinedRange::from_ranges(&hand_ranges);
+    for cr in &combined_ranges {
+        if cr.size() == 0 {
+            return Err(SimulatorError::ConflictingRanges);
+        }
+    }
+
+    let n_players = hand_ranges.len();
+    let fixed_board = Hand::from_bit_mask(board_mask);
+
+    let fast_dividers: Vec<DividerU64> = combined_ranges
+        .iter()
+        .map(|c| DividerU64::divide_by(c.size() as u64))
+        .collect();
+
+    let postflop_combos = seq_get_postflop_combo_count(&fixed_board, n_players);
+    let use_lookup = postflop_combos > 500;
+
+    let preflop_combos: u64 = combined_ranges
+        .iter()
+        .fold(1u64, |acc, c| acc * c.size() as u64);
+
+    // All state is local — zero synchronisation.
+    let mut results = SimulationResults::init(n_players);
+    let mut lookup_table: HashMap<(u64, u64), SimulationResultsBatch> = HashMap::new();
+    let mut stats = SimulationResultsBatch::init(n_players);
+
+    for enum_pos in 0..preflop_combos {
+        let mut rand_enum_pos = enum_pos;
+        let mut ok = true;
+        let mut used_cards_mask = board_mask;
+        let mut player_hands = [HandWithIndex::default(); MAX_PLAYERS];
+
+        for i in 0..combined_ranges.len() {
+            let quotient = fast_dividers[i].divide(rand_enum_pos);
+            let remainder =
+                rand_enum_pos - quotient * combined_ranges[i].size() as u64;
+            rand_enum_pos = quotient;
+            let combo = &combined_ranges[i].combos()[remainder as usize];
+            if (used_cards_mask & combo.mask) != 0 {
+                ok = false;
+                break;
+            }
+            used_cards_mask |= combo.mask;
+            for j in 0..combined_ranges[i].player_count() {
+                let player_idx = combined_ranges[i].players()[j];
+                player_hands[player_idx].cards = combo.hole_cards[j];
+                player_hands[player_idx].player_idx = player_idx;
+            }
+        }
+
+        if ok {
+            let mut weight = 1u64;
+            for hand in &player_hands[0..n_players] {
+                weight *= u64::from(hand.cards.2);
+            }
+            let mut local_board_mask = board_mask;
+
+            if use_lookup {
+                player_hands[0..n_players].sort();
+                for i in 0..n_players {
+                    stats.player_ids[i] = player_hands[i].player_idx;
+                }
+                seq_transform_suits(&mut player_hands, n_players, &mut local_board_mask);
+                used_cards_mask = local_board_mask;
+                for j in 0..n_players {
+                    used_cards_mask |= (1u64 << player_hands[j].cards.0)
+                        | (1u64 << player_hands[j].cards.1);
+                }
+
+                let preflop_id = calculate_preflop_id(&player_hands, n_players);
+                let key = (preflop_id, weight);
+
+                if let Some(&cached) = lookup_table.get(&key) {
+                    stats = cached;
+                    for i in 0..n_players {
+                        stats.player_ids[i] = player_hands[i].player_idx;
+                    }
+                    stats.eval_count = 0;
+                } else {
+                    let board = Hand::from_bit_mask(local_board_mask);
+                    seq_enumerate_board(
+                        &player_hands,
+                        weight,
+                        &board,
+                        used_cards_mask,
+                        &mut stats,
+                        n_players,
+                    );
+                    lookup_table.insert(key, stats);
+                }
+
+                seq_update_results(&mut results, &stats, n_players);
+                stats = SimulationResultsBatch::init(n_players);
+            } else {
+                seq_enumerate_board(
+                    &player_hands,
+                    weight,
+                    &fixed_board,
+                    used_cards_mask,
+                    &mut stats,
+                    n_players,
+                );
+
+                if stats.eval_count >= 10000 {
+                    seq_update_results(&mut results, &stats, n_players);
+                    stats = SimulationResultsBatch::init(n_players);
+                }
+            }
+        }
+    }
+
+    seq_update_results(&mut results, &stats, n_players);
+    Ok(results.get_equity())
+}
+
+// ---------------------------------------------------------------------------
+// Sequential helper free-functions (mirrors of the Simulator methods, but
+// take explicit params instead of &self so no synchronisation is needed).
+// ---------------------------------------------------------------------------
+
+fn seq_get_postflop_combo_count(fixed_board: &Hand, n_players: usize) -> u64 {
+    let mut cards_in_deck = u64::from(CARD_COUNT) - u64::from(fixed_board.count());
+    cards_in_deck -= 2 * n_players as u64;
+    let board_cards_remaining = 5 - u64::from(fixed_board.count());
+    let mut postflop_combos = 1u64;
+    for i in 0..board_cards_remaining {
+        postflop_combos *= cards_in_deck - i;
+    }
+    for i in 0..board_cards_remaining {
+        postflop_combos /= i + 1;
+    }
+    postflop_combos
+}
+
+fn seq_transform_suits(
+    player_hands: &mut [HandWithIndex],
+    n_players: usize,
+    board_mask: &mut u64,
+) {
+    let mut transform = [u8::MAX; 4];
+    let mut suit_count = 0u8;
+    let mut new_board_cards = 0u64;
+    for i in 0..CARD_COUNT {
+        if ((*board_mask >> i) & 1) != 0 {
+            let suit = i & SUIT_MASK;
+            if transform[usize::from(suit)] == u8::MAX {
+                transform[usize::from(suit)] = suit_count;
+                suit_count += 1;
+            }
+            let new_card = (i & RANK_MASK) | transform[usize::from(suit)];
+            new_board_cards |= 1u64 << new_card;
+        }
+    }
+    *board_mask = new_board_cards;
+    for i in 0..n_players {
+        let suit0 = player_hands[i].cards.0 & SUIT_MASK;
+        if transform[usize::from(suit0)] == u8::MAX {
+            transform[usize::from(suit0)] = suit_count;
+            suit_count += 1;
+        }
+        player_hands[i].cards.0 =
+            (player_hands[i].cards.0 & RANK_MASK) | transform[usize::from(suit0)];
+
+        let suit1 = player_hands[i].cards.1 & SUIT_MASK;
+        if transform[usize::from(suit1)] == u8::MAX {
+            transform[usize::from(suit1)] = suit_count;
+            suit_count += 1;
+        }
+        player_hands[i].cards.1 =
+            (player_hands[i].cards.1 & RANK_MASK) | transform[usize::from(suit1)];
+    }
+}
+
+fn seq_enumerate_board(
+    player_hands: &[HandWithIndex],
+    weight: u64,
+    board: &Hand,
+    used_cards_mask: u64,
+    stats: &mut SimulationResultsBatch,
+    n_players: usize,
+) {
+    let mut hands = [Hand::default(); MAX_PLAYERS];
+    for i in 0..n_players {
+        hands[i] =
+            Hand::from_hole_cards(player_hands[i].cards.0, player_hands[i].cards.1);
+    }
+
+    let cards_remaining = (BOARD_CARDS - board.count()) as u8;
+    if cards_remaining == 0 {
+        seq_evaluate_hands(&hands, weight, board, stats, true, n_players);
+        return;
+    }
+
+    let mut deck = [0u8; 52];
+    let mut n_deck = 0;
+    for i in (0..CARD_COUNT).rev() {
+        if (used_cards_mask & (1u64 << i)) == 0 {
+            deck[n_deck] = i;
+            n_deck += 1;
+        }
+    }
+
+    let mut suit_counts = [0u8; 4];
+    for i in 0..n_players {
+        if (player_hands[i].cards.0 & 3) == (player_hands[i].cards.1 & 3) {
+            suit_counts[usize::from(player_hands[i].cards.0 & 3)] =
+                std::cmp::max(2, suit_counts[usize::from(player_hands[i].cards.0 & 3)]);
+        } else {
+            suit_counts[usize::from(player_hands[i].cards.0 & 3)] =
+                std::cmp::max(1, suit_counts[usize::from(player_hands[i].cards.0 & 3)]);
+            suit_counts[usize::from(player_hands[i].cards.1 & 3)] =
+                std::cmp::max(1, suit_counts[usize::from(player_hands[i].cards.1 & 3)]);
+        }
+    }
+    for i in 0..SUIT_COUNT {
+        suit_counts[usize::from(i)] += board.suit_count(i) as u8;
+    }
+
+    seq_enumerate_board_rec(
+        &hands,
+        stats,
+        board,
+        &mut deck,
+        n_deck,
+        &mut suit_counts,
+        cards_remaining,
+        0,
+        weight,
+        n_players,
+    );
+}
+
+fn seq_enumerate_board_rec(
+    hands: &[Hand],
+    stats: &mut SimulationResultsBatch,
+    board: &Hand,
+    deck: &mut [u8],
+    n_deck: usize,
+    suit_counts: &mut [u8],
+    cards_remaining: u8,
+    start: usize,
+    weight: u64,
+    n_players: usize,
+) {
+    if cards_remaining == 1 {
+        if suit_counts[0] < 4
+            && suit_counts[1] < 4
+            && suit_counts[2] < 4
+            && suit_counts[3] < 4
+        {
+            let mut i = start;
+            while i < n_deck {
+                let mut multiplier = 1u64;
+                let new_board = *board + CARDS[usize::from(deck[i])];
+                let rank = deck[i] >> 2;
+                i += 1;
+                while i < n_deck && deck[i] >> 2 == rank {
+                    multiplier += 1;
+                    i += 1;
+                }
+                seq_evaluate_hands(
+                    hands,
+                    weight * multiplier,
+                    &new_board,
+                    stats,
+                    false,
+                    n_players,
+                );
+            }
+        } else {
+            let mut last_rank = u8::MAX;
+            for i in start..n_deck {
+                let mut multiplier = 1u64;
+                if suit_counts[usize::from(deck[i] & 3)] < 4 {
+                    let rank = deck[i] >> 2;
+                    if rank == last_rank {
+                        continue;
+                    }
+                    for j in i + 1..n_deck {
+                        if deck[j] >> 2 != rank {
+                            break;
+                        }
+                        if suit_counts[usize::from(deck[j] & 3)] < 4 {
+                            multiplier += 1;
+                        }
+                    }
+                    last_rank = rank;
+                }
+                let new_board = *board + CARDS[usize::from(deck[i])];
+                seq_evaluate_hands(hands, weight * multiplier, &new_board, stats, true, n_players);
+            }
+        }
+        return;
+    }
+
+    let mut i = start;
+    while i < n_deck {
+        let mut new_board = *board;
+        let suit = deck[i] & 3;
+        if (suit_counts[usize::from(suit)] + cards_remaining) < 5 {
+            let mut irrelevant_count = 1usize;
+            let rank = deck[i] >> 2;
+            for j in i + 1..n_deck {
+                if deck[j] >> 2 != rank {
+                    break;
+                }
+                let suit2 = deck[j] & 3;
+                if (suit_counts[usize::from(suit2)] + cards_remaining) < 5 {
+                    if j != i + irrelevant_count {
+                        deck.swap(j, i + irrelevant_count);
+                    }
+                    irrelevant_count += 1;
+                }
+            }
+
+            for repeats in 1..=std::cmp::min(irrelevant_count, usize::from(cards_remaining)) {
+                const BINOM_COEFF: [[u64; 5]; 5] = [
+                    [0, 0, 0, 0, 0],
+                    [0, 1, 0, 0, 0],
+                    [1, 2, 1, 0, 0],
+                    [1, 3, 3, 1, 0],
+                    [1, 4, 6, 4, 1],
+                ];
+                let new_weight = BINOM_COEFF[irrelevant_count][repeats] * weight;
+                new_board += CARDS[usize::from(deck[i + repeats - 1])];
+                if repeats == usize::from(cards_remaining) {
+                    seq_evaluate_hands(&hands, new_weight, &new_board, stats, true, n_players);
+                } else {
+                    seq_enumerate_board_rec(
+                        hands,
+                        stats,
+                        &new_board,
+                        deck,
+                        n_deck,
+                        suit_counts,
+                        cards_remaining - repeats as u8,
+                        i + irrelevant_count,
+                        new_weight,
+                        n_players,
+                    );
+                }
+            }
+
+            i += irrelevant_count - 1;
+        } else {
+            new_board += CARDS[usize::from(deck[i])];
+            suit_counts[usize::from(suit)] += 1;
+            seq_enumerate_board_rec(
+                hands,
+                stats,
+                &new_board,
+                deck,
+                n_deck,
+                suit_counts,
+                cards_remaining - 1,
+                i + 1,
+                weight,
+                n_players,
+            );
+            suit_counts[usize::from(suit)] -= 1;
+        }
+        i += 1;
+    }
+}
+
+fn seq_evaluate_hands(
+    player_hands: &[Hand],
+    weight: u64,
+    board: &Hand,
+    results: &mut SimulationResultsBatch,
+    flush_possible: bool,
+    n_players: usize,
+) {
+    let mut winner_mask: u8 = 0;
+    let mut best_score: u16 = 0;
+    let mut player_mask: u8 = 1;
+    for i in 0..n_players {
+        let hand: Hand = *board + player_hands[i];
+        let score = if flush_possible {
+            evaluate(&hand)
+        } else {
+            evaluate_without_flush(&hand)
+        };
+        match (score > best_score, score == best_score) {
+            (true, false) => {
+                best_score = score;
+                winner_mask = player_mask;
+            }
+            (false, true) => {
+                winner_mask |= player_mask;
+            }
+            _ => {}
+        }
+        player_mask <<= 1;
+    }
+    results.wins_by_mask[usize::from(winner_mask)] += weight;
+    results.eval_count += 1;
+}
+
+fn seq_update_results(
+    results: &mut SimulationResults,
+    batch: &SimulationResultsBatch,
+    n_players: usize,
+) {
+    for i in 0..(1usize << n_players) {
+        if batch.wins_by_mask[i] == 0 {
+            continue;
+        }
+        let winner_count = (i as u32).count_ones() as u64;
+        let mut actual_player_mask = 0usize;
+        for j in 0..n_players {
+            if (i & (1 << j)) != 0 {
+                if winner_count == 1 {
+                    results.wins[batch.player_ids[j]] += batch.wins_by_mask[i];
+                } else {
+                    results.ties[batch.player_ids[j]] +=
+                        (batch.wins_by_mask[i] / winner_count) as f64;
+                }
+                actual_player_mask |= 1 << batch.player_ids[j];
+            }
+        }
+        results.wins_by_mask[actual_player_mask] += batch.wins_by_mask[i];
+    }
+    results.eval_count += batch.eval_count;
+}
+
 fn calculate_preflop_id(player_hands: &[HandWithIndex], n_players: usize) -> u64 {
     let mut preflop_id = 0u64;
     for hand in &player_hands[0..n_players] {
@@ -978,19 +1429,95 @@ mod tests {
 
     #[test]
     fn test_exact_multi_combined_range() {
-        // regression: 4 non-conflicting ranges fully join past MAX_SIZE, so they
-        // split into 2 combined ranges (players [0,1] and [2,3]). The exact path
-        // must index combo.hole_cards by local position, not global player_idx,
-        // or players 2/3 read the (52,52,0) default and panic in from_hole_cards.
         const THREADS: u8 = 4;
         let ranges = HandRange::from_strings(
             ["AKo".to_string(), "QJo".to_string(), "T9o".to_string(), "87o".to_string()].to_vec(),
         );
         let equity = exact_equity(&ranges, get_card_mask(""), THREADS).unwrap();
         assert!((equity.iter().sum::<f64>() - 1.0).abs() < 1e-9);
-        // AKo dominates the other three offsuit holdings
         assert!(equity[0] > equity[1]);
         assert!(equity[0] > equity[2]);
         assert!(equity[0] > equity[3]);
+    }
+
+    // -----------------------------------------------------------------------
+    // exact_equity_seq validation — must match exact_equity bit-for-bit
+    // -----------------------------------------------------------------------
+
+    fn assert_seq_matches(ranges: &[HandRange], board: u64) {
+        let ref_eq = exact_equity(ranges, board, 1).unwrap();
+        let seq_eq = exact_equity_seq(ranges, board).unwrap();
+        assert_eq!(
+            ref_eq.len(),
+            seq_eq.len(),
+            "player count mismatch"
+        );
+        for (i, (r, s)) in ref_eq.iter().zip(seq_eq.iter()).enumerate() {
+            assert_eq!(
+                r, s,
+                "player {i} equity diverged: exact={r} seq={s} board={board:#018x}"
+            );
+        }
+    }
+
+    /// Distinct non-overlapping 2-player matchup (lookup path, postflop > 500).
+    #[test]
+    fn seq_matches_distinct_heads_up() {
+        let ranges =
+            HandRange::from_strings(["AA".to_string(), "random".to_string()].to_vec());
+        assert_seq_matches(&ranges, get_card_mask(""));
+    }
+
+    /// Weighted range (duplicate-class combos share equity classes).
+    #[test]
+    fn seq_matches_weighted_range() {
+        let ranges = HandRange::from_strings(
+            ["KK".to_string(), "AA@1,QQ".to_string()].to_vec(),
+        );
+        assert_seq_matches(&ranges, get_card_mask(""));
+    }
+
+    /// 4-way with 2 combined-range groups (non-lookup path on a river board).
+    #[test]
+    fn seq_matches_4way_river() {
+        let ranges = HandRange::from_strings(
+            [
+                "AKo".to_string(),
+                "QJo".to_string(),
+                "T9o".to_string(),
+                "87o".to_string(),
+            ]
+            .to_vec(),
+        );
+        // River board — only 0 cards to deal, so postflop_combos == 1 < 500 → no-lookup path.
+        let board = get_card_mask("2h3d4c5s6d");
+        assert_seq_matches(&ranges, board);
+    }
+
+    /// Flop board — partial board deals, exercises the intermediate recursion.
+    #[test]
+    fn seq_matches_flop_board() {
+        let ranges =
+            HandRange::from_strings(["AA".to_string(), "KK".to_string()].to_vec());
+        let board = get_card_mask("2h3d4c");
+        assert_seq_matches(&ranges, board);
+    }
+
+    /// Undealable board: board card conflicts with a range → ConflictingRanges error.
+    #[test]
+    fn seq_errors_on_conflicting_ranges() {
+        // AcAd vs anything — but board uses Ac, so AA becomes undealable.
+        let ranges =
+            HandRange::from_strings(["AcAd".to_string(), "AhAs".to_string()].to_vec());
+        // Board uses Ac — only one AA combo left (AhAs) but AhAs is the full
+        // second range, so after filtering nothing remains for the first range.
+        let board = get_card_mask("Ac2d3h");
+        let seq_res = exact_equity_seq(&ranges, board);
+        let ref_res = exact_equity(&ranges, board, 1);
+        assert_eq!(
+            seq_res.is_err(),
+            ref_res.is_err(),
+            "error parity mismatch: seq={seq_res:?} ref={ref_res:?}"
+        );
     }
 }
