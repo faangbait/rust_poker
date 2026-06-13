@@ -48,3 +48,4 @@ pub mod hand_range;
 pub mod range_filter;
 
 pub mod equity_calculator;
+pub mod showdown;
