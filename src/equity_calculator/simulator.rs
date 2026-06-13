@@ -611,8 +611,13 @@ fn seq_update_results(
                 if winner_count == 1 {
                     results.wins[batch.player_ids[j]] += batch.wins_by_mask[i];
                 } else {
+                    // Split pots must divide in f64: integer divide then cast
+                    // (`(u64 / u64) as f64`) drops the remainder on any
+                    // non-divisible tie (e.g. 3-way), losing equity. Mirrors the
+                    // threaded `update_results` and OMPEval's
+                    // `winsByPlayerMask[i] / (double)winnerCount`.
                     results.ties[batch.player_ids[j]] +=
-                        (batch.wins_by_mask[i] / winner_count) as f64;
+                        batch.wins_by_mask[i] as f64 / winner_count as f64;
                 }
                 actual_player_mask |= 1 << batch.player_ids[j];
             }
