@@ -12,7 +12,7 @@ pub const RANK_TO_CHAR: &[char; 13] = &[
 ];
 
 /// char to u8 suit table
-pub static SUIT_TO_CHAR: &[char; 4] = &['s', 'h', 'd', 'c'];
+pub const SUIT_TO_CHAR: &[char; 4] = &['s', 'h', 'd', 'c'];
 
 pub static SUIT_MASK: u8 = 0x3;
 pub static RANK_MASK: u8 = 0x3c;
